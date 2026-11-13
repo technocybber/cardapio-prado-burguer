@@ -381,17 +381,23 @@
     const SALES_MODULE_UNLOCKED = false;
     const CEP_DELIVERY_CONFIG = { baseCep: "08340-190", deliveryKmBase: 7, deliveryExtraKmRate: 2 };
     const OH_SCHEDULE = {"0":[{"start":1080,"end":1320}],"1":[],"2":[{"start":1080,"end":1410}],"3":[{"start":1080,"end":1410}],"4":[{"start":1080,"end":1410}],"5":[{"start":1080,"end":1410}],"6":[{"start":1080,"end":1410}]};
+    const BUILD_SIGNATURE = "1794588654537";
     let cart = {};
     let selectedCategory = 'Todos';
     let currentOrderType = 'delivery';
     let clientClicks = 0;
 
-    const savedCustom = localStorage.getItem('DELIVERY_CUSTOM_' + (store.name || 'STORE'));
+    const savedCustomKey = 'DELIVERY_CUSTOM_' + (store.name || 'STORE');
+    const savedCustom = localStorage.getItem(savedCustomKey);
     if (savedCustom) {
       try {
         const parsed = JSON.parse(savedCustom);
-        if (parsed.items) items = parsed.items;
-        if (parsed.store) store = Object.assign({}, store, parsed.store);
+        if (parsed && parsed.buildSignature === BUILD_SIGNATURE) {
+          if (parsed.items) items = parsed.items;
+          if (parsed.store) store = Object.assign({}, store, parsed.store);
+        } else {
+          localStorage.removeItem(savedCustomKey);
+        }
       } catch(e){}
     }
     store.stockModuleUnlocked = STOCK_MODULE_UNLOCKED;
@@ -399,6 +405,12 @@
     store.baseCep = CEP_DELIVERY_CONFIG.baseCep;
     store.deliveryKmBase = CEP_DELIVERY_CONFIG.deliveryKmBase;
     store.deliveryExtraKmRate = CEP_DELIVERY_CONFIG.deliveryExtraKmRate;
+
+    function saveDeliveryCustomState() {
+      try {
+        localStorage.setItem('DELIVERY_CUSTOM_' + (store.name || 'STORE'), JSON.stringify({ buildSignature: BUILD_SIGNATURE, items: items, store: store }));
+      } catch(e){}
+    }
 
     function checkExpiration() {
       if (store.expirationDate) {
@@ -820,20 +832,22 @@
       try {
         fetch(SHEET_WEBHOOK_URL, {
           method: 'POST',
+          mode: 'no-cors',
+          keepalive: true,
           headers: { 'Content-Type': 'text/plain;charset=utf-8' },
           body: JSON.stringify({ aba: aba, cabecalho: cabecalho, linhas: linhas })
-        }).catch(function () {});
+        }).catch(function (e) { console.error('Falha ao enviar pedido para a planilha:', e); });
       } catch (e) {}
     }
 
-        let _deliveryStockSyncTimer = null;
+    let _deliveryStockSyncTimer = null;
     let _deliveryLastStockChangeAt = 0;
     function scheduleDeliveryStockSync() {
       _deliveryLastStockChangeAt = Date.now();
       clearTimeout(_deliveryStockSyncTimer);
       _deliveryStockSyncTimer = setTimeout(function () {
         _deliveryStockSyncTimer = null;
-        localStorage.setItem('DELIVERY_CUSTOM_' + (store.name || 'STORE'), JSON.stringify({ items: items, store: store }));
+        saveDeliveryCustomState();
         sendStockToSheet('Atualização de estoque em tempo real');
       }, 500);
     }
@@ -850,12 +864,13 @@
         fetch(SHEET_WEBHOOK_URL, {
           method: 'POST',
           mode: 'no-cors',
+          keepalive: true,
           headers: { 'Content-Type': 'text/plain;charset=utf-8' },
           body: JSON.stringify({ aba: 'Estoque_' + SHEET_STOCK_STORE_KEY, cabecalho: SHEET_ESTOQUE_HEADERS, linhas: linhas })
         }).catch(function (e) { console.error('Falha ao enviar estoque normal para a planilha:', e); });
       } catch (e) {}
     }
-    function loadStockMapFromSheet(loja) {
+    function loadStockMapJsonpFromSheet(chaveLoja) {
       return new Promise(function (resolve, reject) {
         var callbackName = '__stockDelivery_' + Date.now() + '_' + Math.floor(Math.random() * 1000000);
         var script = document.createElement('script');
@@ -863,9 +878,27 @@
         function cleanup() { clearTimeout(timer); delete window[callbackName]; if (script.parentNode) script.parentNode.removeChild(script); }
         window[callbackName] = function (data) { cleanup(); resolve(data || {}); };
         script.onerror = function () { cleanup(); reject(new Error('Não foi possível acessar o estoque da planilha.')); };
-        script.src = SHEET_WEBHOOK_URL + '?loja=' + encodeURIComponent(SHEET_STOCK_STORE_KEY) + '&callback=' + callbackName + '&_=' + Date.now();
+        script.src = SHEET_WEBHOOK_URL + '?loja=' + encodeURIComponent(chaveLoja) + '&callback=' + callbackName + '&_=' + Date.now();
         document.head.appendChild(script);
       });
+    }
+    function loadStockMapFromSheet(loja) {
+      var chaveLoja = (store.name || '') + '__NORMAL';
+      var urlJson = SHEET_WEBHOOK_URL + '?loja=' + encodeURIComponent(chaveLoja) + '&_=' + Date.now();
+      if (typeof fetch === 'function') {
+        return fetch(urlJson, { cache: 'no-store' })
+          .then(function (res) {
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            return res.json();
+          })
+          .catch(function () {
+            return loadStockMapJsonpFromSheet(chaveLoja);
+          });
+      }
+      return loadStockMapJsonpFromSheet(chaveLoja);
+    }
+    function normStockKey(s) {
+      return String(s || '').toLocaleLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]/g, '');
     }
     function pullStockFromSheet() {
       try {
@@ -873,29 +906,49 @@
         loadStockMapFromSheet(store.name || '')
           .then(function (mapa) {
             if (!mapa || typeof mapa !== 'object') return;
-            if (document.activeElement && /^owner-it-stock-/.test(document.activeElement.id || '')) return;
+            if (document.activeElement && /^owner-it-(stock|name|price)-/.test(document.activeElement.id || '')) return;
+            var metaByKey = (mapa.__meta && mapa.__meta.byKey) || {};
+            var metaByName = (mapa.__meta && mapa.__meta.byName) || {};
             var mudou = false;
             items.forEach(function (it) {
               if (!it || !it.name) return;
               var nome = String(it.name).trim();
               var chave = nome.toLocaleLowerCase() + '||' + String(it.category || '').trim().toLocaleLowerCase();
               var v = mapa[chave] !== undefined ? mapa[chave] : mapa[nome];
+              var meta = metaByKey[chave] || metaByName[nome] || null;
+              if (v === undefined) {
+                var nomeNorm = normStockKey(nome);
+                var chaveAlt = Object.keys(mapa).find(function (k) { return k.indexOf('__') !== 0 && normStockKey(k) === nomeNorm; });
+                if (chaveAlt !== undefined) v = mapa[chaveAlt];
+              }
               if (v !== undefined && v !== null && v !== '') {
                 var n = parseInt(v, 10);
-                if (!isNaN(n) && it.stock !== n) { it.stock = n; mudou = true; }
+                if (!isNaN(n) && it.stock !== n) {
+                  it.stock = n;
+                  if (cart[it.id] && cart[it.id] > n) {
+                    if (n <= 0) delete cart[it.id];
+                    else cart[it.id] = n;
+                  }
+                  mudou = true;
+                }
+              }
+              if (meta && meta.preco !== null && meta.preco !== undefined && isFinite(Number(meta.preco))) {
+                var p = Math.round(Number(meta.preco) * 100) / 100;
+                if (Math.abs(Number(it.price || 0) - p) > 0.001) { it.price = p; mudou = true; }
               }
             });
             if (mudou) {
-              localStorage.setItem('DELIVERY_CUSTOM_' + (store.name || 'STORE'), JSON.stringify({ items: items, store: store }));
+              saveDeliveryCustomState();
               renderCatalog();
+              updateTotal();
               if (typeof renderOwnerMenuEditorTable === 'function') renderOwnerMenuEditorTable();
               if (typeof renderOwnerStockTable === 'function') renderOwnerStockTable();
             }
           })
-          .catch(function () {});
+          .catch(function (e) { console.error('Falha ao ler estoque normal na planilha:', e); });
       } catch (e) {}
     }
-    setTimeout(pullStockFromSheet, 2000);
+    setTimeout(pullStockFromSheet, 1500);
     setInterval(function () { if (!document.hidden) pullStockFromSheet(); }, 3000);
     window.addEventListener('focus', pullStockFromSheet);
     document.addEventListener('visibilitychange', function () { if (!document.hidden) pullStockFromSheet(); });
@@ -969,7 +1022,8 @@
         timestamp: `${now.toLocaleDateString('pt-BR')} ${now.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}`
       });
       localStorage.setItem('DELIVERY_ORDERS_' + (store.name || 'STORE'), JSON.stringify(existingOrders));
-      localStorage.setItem('DELIVERY_CUSTOM_' + (store.name || 'STORE'), JSON.stringify({ items, store }));
+      _deliveryLastStockChangeAt = Date.now();
+      saveDeliveryCustomState();
 
       const padN = n => String(n).padStart(2, '0');
       const dataHora = padN(now.getDate()) + '/' + padN(now.getMonth() + 1) + '/' + now.getFullYear() + ' ' + padN(now.getHours()) + ':' + padN(now.getMinutes()) + ':' + padN(now.getSeconds());
@@ -1149,7 +1203,8 @@
         if (stockEl) it.stock = parseInt(stockEl.value, 10) || 0;
       });
 
-      localStorage.setItem('DELIVERY_CUSTOM_' + (store.name || 'STORE'), JSON.stringify({ items, store }));
+      _deliveryLastStockChangeAt = Date.now();
+      saveDeliveryCustomState();
       sendStockToSheet('Edição do Proprietário');
       renderCatalog();
       renderOwnerMenuEditorTable();
@@ -1206,7 +1261,7 @@
       store.deliveryTime = document.getElementById('owner-cfg-time').value.trim() || store.deliveryTime;
       store.pickupAddress = document.getElementById('owner-cfg-address').value.trim() || store.pickupAddress;
 
-      localStorage.setItem('DELIVERY_CUSTOM_' + (store.name || 'STORE'), JSON.stringify({ items, store }));
+      saveDeliveryCustomState();
       alert('✅ Dados da loja salvos com sucesso!');
       location.reload();
     }
